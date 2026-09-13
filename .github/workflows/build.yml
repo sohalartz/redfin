@@ -142,40 +142,46 @@ jobs:
           cp magisk_env/lib/arm64-v8a/libmagisk.so ./magisk
           chmod +x ./magisk
           cp magisk_env/lib/arm64-v8a/libinit-ld.so ./init-ld
-          cp magisk_env/assets/boot_patch.sh ./
-          cp magisk_env/assets/util_functions.sh ./
           cp magisk_env/assets/stub.apk ./
 
-          # 4. Patch stock_boot.img with Magisk (bypass Android env check)
-          export ARCH=arm64
-          export ABI=arm64-v8a
-          export ABI32=armeabi-v7a
-          export IS64BIT=true
-          export API=36
-          export BOOTMODE=false
-          export KEEPVERITY=false
-          export KEEPFORCEENCRYPT=true
-          export PATCHVBMETAFLAG=false
+          # 4. Unpack stock boot.img with magiskboot (extracts raw ramdisk.cpio)
+          ./magiskboot unpack stock_boot.img
+          cp ramdisk.cpio stock_ramdisk.cpio
 
-          # Prevent util_functions from trying to read Android build.prop
-          sed -i 's/api_level_arch_detect/# api_level_arch_detect/' boot_patch.sh
+          # 5. Compress Magisk payloads with magiskboot
+          ./magiskboot compress=xz magisk magisk.xz
+          ./magiskboot compress=xz stub.apk stub.xz
+          ./magiskboot compress=xz init-ld init-ld.xz
 
-          sh boot_patch.sh stock_boot.img
+          # 6. Patch ramdisk.cpio with Magisk root
+          echo "KEEPVERITY=false" > config
+          echo "KEEPFORCEENCRYPT=true" >> config
+          echo "PATCHVBMETAFLAG=false" >> config
+          echo "RECOVERYMODE=false" >> config
 
-          echo "Magisk patching output:"
-          ls -lh new-boot.img || true
+          ./magiskboot cpio ramdisk.cpio \
+            "add 0750 init magiskinit" \
+            "mkdir 0750 overlay.d" \
+            "mkdir 0750 overlay.d/sbin" \
+            "add 0644 overlay.d/sbin/magisk.xz magisk.xz" \
+            "add 0644 overlay.d/sbin/stub.xz stub.xz" \
+            "add 0644 overlay.d/sbin/init-ld.xz init-ld.xz" \
+            "patch" \
+            "backup stock_ramdisk.cpio" \
+            "mkdir 000 .backup" \
+            "add 000 .backup/.magisk config"
 
-          # 5. Extract Magisk-patched ramdisk and stock ramdisk
-          python3 mkbootimg_tools/unpack_bootimg.py --boot_img new-boot.img --out magisk_unpacked
-          python3 mkbootimg_tools/unpack_bootimg.py --boot_img stock_boot.img --out stock_unpacked
+          # 7. Compress patched ramdisk to lz4_legacy format expected by Pixel 5 ABL
+          ./magiskboot compress=lz4_legacy ramdisk.cpio magisk_ramdisk.lz4
+          ./magiskboot compress=lz4_legacy stock_ramdisk.cpio stock_ramdisk.lz4
 
-          # 6. Repack Pre-Rooted Docker boot.img
+          # 8. Repack Pre-Rooted Docker boot.img with AOSP mkbootimg
           python3 mkbootimg_tools/mkbootimg.py \
             --header_version 3 \
             --os_version 16.0.0 \
             --os_patch_level 2026-08 \
             --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
-            --ramdisk magisk_unpacked/ramdisk \
+            --ramdisk magisk_ramdisk.lz4 \
             -o boot-docker-magisk-raw.img
 
           # Sign with AVB 2.0 footer and pad to 96 MB (100,663,296 bytes)
@@ -188,13 +194,13 @@ jobs:
 
           mv boot-docker-magisk-raw.img $GITHUB_WORKSPACE/boot-docker-magisk-redfin.img
 
-          # 7. Repack Stock-Ramdisk (No-Magisk) Docker boot.img
+          # 9. Repack Clean Stock-Ramdisk (No-Magisk) Docker boot.img
           python3 mkbootimg_tools/mkbootimg.py \
             --header_version 3 \
             --os_version 16.0.0 \
             --os_patch_level 2026-08 \
             --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
-            --ramdisk stock_unpacked/ramdisk \
+            --ramdisk stock_ramdisk.lz4 \
             -o boot-docker-stock-raw.img
 
           python3 avb_tools/avbtool.py add_hash_footer \
