@@ -25,7 +25,7 @@ jobs:
         run: |
           git clone https://github.com/LineageOS/android_kernel_google_redbull.git -b lineage-23.2 --depth=1 kernel
 
-      - name: Patch Defconfig for Docker Support & Standalone LLVM
+      - name: Patch Defconfig & DTS for Docker Support
         run: |
           cd kernel
           DEFCONFIG="arch/arm64/configs/redbull_defconfig"
@@ -65,7 +65,10 @@ jobs:
           CONFIG_VXLAN=y
           EOF
 
-      - name: Compile Kernel (Image.lz4 & dtbo.img)
+          # 5. Fix legacy prototype DTS error in lito-redfin-dev.dtsi
+          sed -i '/\/delete-node\/ disp_pins;/d' arch/arm64/boot/dts/google/lito-redfin-dev.dtsi
+
+      - name: Compile Kernel (Image.lz4)
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           cd kernel
@@ -79,7 +82,10 @@ jobs:
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            Image.lz4 dtbo.img -j$(nproc --all)
+            Image.lz4 -j$(nproc --all)
+
+          echo "Kernel compiled successfully:"
+          ls -lh out/arch/arm64/boot/Image.lz4
 
       - name: Package with AnyKernel3
         run: |
@@ -88,9 +94,6 @@ jobs:
           sed -i 's/device.name1=.*/device.name1=redfin/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=bramble/' anykernel.sh
           cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
-          if [ -f $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img ]; then
-            cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img .
-          fi
           zip -r9 $GITHUB_WORKSPACE/AnyKernel3-LineageOS23.2-Docker-redfin.zip * -x .git README.md *placeholder
 
       - name: Repack Official boot.img
