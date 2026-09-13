@@ -1,4 +1,4 @@
-﻿name: Build Pixel 5 Docker Kernel
+name: Build Pixel 5 Docker Kernel
 
 on:
   workflow_dispatch:
@@ -15,7 +15,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
             git curl zip lz4 python3 python-is-python3 ccache \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libncurses5 libtinfo5 || true
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libncurses5 libtinfo5 \
+            cpio binutils || true
 
       - name: Download Proton-Clang Compiler
         run: |
@@ -36,12 +37,15 @@ jobs:
           # 2. Enable Fair Group Scheduling (required for CPU bandwidth quota)
           sed -i 's/# CONFIG_FAIR_GROUP_SCHED is not set/CONFIG_FAIR_GROUP_SCHED=y/' $DEFCONFIG
 
-          # 3. Disable LTO & CFI for clean standalone Clang compilation
+          # 3. Disable LTO & CFI for standalone Clang compilation
           sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
           sed -i 's/CONFIG_CFI_CLANG=y/# CONFIG_CFI_CLANG is not set/' $DEFCONFIG
           echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
 
-          # 4. Append required Docker, cgroup, and networking configurations
+          # 4. Disable auto localversion to keep vermagic clean
+          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          # 5. Append required Docker, cgroup, and networking configurations
           cat << 'EOF' >> $DEFCONFIG
 
           # --- Container & Docker Support ---
@@ -65,10 +69,10 @@ jobs:
           CONFIG_VXLAN=y
           EOF
 
-          # 5. Fix legacy prototype DTS error in lito-redfin-dev.dtsi
+          # 6. Fix prototype DTS error in lito-redfin-dev.dtsi
           sed -i '/\/delete-node\/ disp_pins;/d' arch/arm64/boot/dts/google/lito-redfin-dev.dtsi
 
-      - name: Compile Kernel (Image.lz4)
+      - name: Compile Kernel & Matching Modules
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           cd kernel
@@ -78,46 +82,120 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             redbull_defconfig
 
+          # Compile both Image.lz4 and all kernel modules
           make O=out ARCH=arm64 \
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            Image.lz4 -j$(nproc --all)
+            Image.lz4 modules -j$(nproc --all)
+
+          # Install modules to a staging directory
+          make O=out ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            INSTALL_MOD_PATH=$GITHUB_WORKSPACE/modules_out \
+            modules_install
 
           echo "Kernel compiled successfully:"
           ls -lh out/arch/arm64/boot/Image.lz4
 
-      - name: Package with AnyKernel3
+      - name: Package with AnyKernel3 (with Modules)
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git --depth=1 anykernel
           cd anykernel
           sed -i 's/device.name1=.*/device.name1=redfin/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=bramble/' anykernel.sh
+          sed -i 's/do.modules=0/do.modules=1/' anykernel.sh
+          sed -i 's/do.systemless=1/do.systemless=1/' anykernel.sh
+
           cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
+
+          # Place compiled modules into AnyKernel3 module directory
+          mkdir -p modules/vendor/lib/modules
+          find $GITHUB_WORKSPACE/modules_out -name "*.ko" -exec cp {} modules/vendor/lib/modules/ \;
+          echo "Copied modules to AnyKernel3 package:"
+          ls modules/vendor/lib/modules | wc -l
+
           zip -r9 $GITHUB_WORKSPACE/AnyKernel3-LineageOS23.2-Docker-redfin.zip * -x .git README.md *placeholder
 
-      - name: Repack Official boot.img with AOSP mkbootimg
+      - name: Pre-Patch Magisk Root & Build 96MB AVB-Signed boot.img
         run: |
           # 1. Download official stock boot.img
           curl -sL https://mirrorbits.lineageos.org/full/redfin/20260907/boot.img -o stock_boot.img
 
-          # 2. Clone official LineageOS mkbootimg tools
-          git clone --depth=1 https://github.com/LineageOS/android_system_tools_mkbootimg.git mkbootimg_tools
+          # 2. Download official AOSP boot & AVB tools
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools
+          git clone --depth=1 https://android.googlesource.com/platform/external/avb avb_tools
 
-          # 3. Unpack stock boot.img to extract ramdisk
-          python3 mkbootimg_tools/unpack_bootimg.py --boot_img stock_boot.img --out unpacked
+          # 3. Download official Magisk release APK and extract binaries
+          MAGISK_VER="v28.1"
+          curl -sL "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VER}/Magisk-${MAGISK_VER}.apk" -o Magisk.apk
+          mkdir -p magisk_env
+          unzip -q Magisk.apk -d magisk_env/
 
-          # 4. Repack using compiled Image.lz4 and extracted ramdisk
+          # Prepare native Linux x86_64 magiskboot and ARM64 binaries
+          cp magisk_env/lib/x86_64/libmagiskboot.so ./magiskboot
+          chmod +x ./magiskboot
+          cp magisk_env/lib/arm64-v8a/libmagiskinit.so ./magiskinit
+          cp magisk_env/lib/arm64-v8a/libmagisk64.so ./magisk64
+          cp magisk_env/lib/arm64-v8a/libmagisk32.so ./magisk32
+          cp magisk_env/assets/boot_patch.sh ./
+          cp magisk_env/assets/util_functions.sh ./
+          cp magisk_env/assets/stub.apk ./
+
+          # 4. Patch stock_boot.img with Magisk
+          export KEEPVERITY=false
+          export KEEPFORCEENCRYPT=true
+          export PATCHVBMETAFLAG=false
+          sh boot_patch.sh stock_boot.img
+
+          echo "Magisk patching output:"
+          ls -lh new-boot.img || true
+
+          # 5. Extract Magisk-patched ramdisk and stock ramdisk
+          python3 mkbootimg_tools/unpack_bootimg.py --boot_img new-boot.img --out magisk_unpacked
+          python3 mkbootimg_tools/unpack_bootimg.py --boot_img stock_boot.img --out stock_unpacked
+
+          # 6. Repack Pre-Rooted Docker boot.img
           python3 mkbootimg_tools/mkbootimg.py \
             --header_version 3 \
             --os_version 16.0.0 \
             --os_patch_level 2026-08 \
             --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
-            --ramdisk unpacked/ramdisk \
-            -o $GITHUB_WORKSPACE/boot-docker-redfin.img
+            --ramdisk magisk_unpacked/ramdisk \
+            -o boot-docker-magisk-raw.img
 
-          echo "Repacked boot.img created successfully:"
-          ls -lh $GITHUB_WORKSPACE/boot-docker-redfin.img
+          # Sign with AVB 2.0 footer and pad to 96 MB (100,663,296 bytes)
+          python3 avb_tools/avbtool.py add_hash_footer \
+            --image boot-docker-magisk-raw.img \
+            --partition_size 100663296 \
+            --partition_name boot \
+            --hash_algorithm sha256 \
+            --salt c9cfcce701396e09844a736f351a4499e64a067948657e4bcbf3b49884e19691
+
+          mv boot-docker-magisk-raw.img $GITHUB_WORKSPACE/boot-docker-magisk-redfin.img
+
+          # 7. Repack Stock-Ramdisk (No-Magisk) Docker boot.img
+          python3 mkbootimg_tools/mkbootimg.py \
+            --header_version 3 \
+            --os_version 16.0.0 \
+            --os_patch_level 2026-08 \
+            --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
+            --ramdisk stock_unpacked/ramdisk \
+            -o boot-docker-stock-raw.img
+
+          python3 avb_tools/avbtool.py add_hash_footer \
+            --image boot-docker-stock-raw.img \
+            --partition_size 100663296 \
+            --partition_name boot \
+            --hash_algorithm sha256 \
+            --salt c9cfcce701396e09844a736f351a4499e64a067948657e4bcbf3b49884e19691
+
+          mv boot-docker-stock-raw.img $GITHUB_WORKSPACE/boot-docker-stock-redfin.img
+
+          echo "Generated Images:"
+          ls -lh $GITHUB_WORKSPACE/*.img
 
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
@@ -125,4 +203,5 @@ jobs:
           name: Pixel5-Docker-Kernel
           path: |
             AnyKernel3-LineageOS23.2-Docker-redfin.zip
-            boot-docker-redfin.img
+            boot-docker-magisk-redfin.img
+            boot-docker-stock-redfin.img
