@@ -25,7 +25,7 @@ jobs:
         run: |
           git clone https://github.com/LineageOS/android_kernel_google_redbull.git -b lineage-23.2 --depth=1 kernel
 
-      - name: Patch Defconfig for Docker Support
+      - name: Patch Defconfig for Docker Support & Standalone LLVM
         run: |
           cd kernel
           DEFCONFIG="arch/arm64/configs/redbull_defconfig"
@@ -36,7 +36,12 @@ jobs:
           # 2. Enable Fair Group Scheduling (required for CPU bandwidth quota)
           sed -i 's/# CONFIG_FAIR_GROUP_SCHED is not set/CONFIG_FAIR_GROUP_SCHED=y/' $DEFCONFIG
 
-          # 3. Append required Docker, cgroup, and networking configurations
+          # 3. Disable LTO & CFI for clean standalone Clang compilation
+          sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
+          sed -i 's/CONFIG_CFI_CLANG=y/# CONFIG_CFI_CLANG is not set/' $DEFCONFIG
+          echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+
+          # 4. Append required Docker, cgroup, and networking configurations
           cat << 'EOF' >> $DEFCONFIG
 
           # --- Container & Docker Support ---
@@ -60,21 +65,21 @@ jobs:
           CONFIG_VXLAN=y
           EOF
 
-      - name: Compile Kernel (Image.lz4)
+      - name: Compile Kernel (Image.lz4 & dtbo.img)
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           cd kernel
           make O=out ARCH=arm64 \
-            CC=clang \
+            LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             redbull_defconfig
 
           make O=out ARCH=arm64 \
-            CC=clang \
+            LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            -j$(nproc --all)
+            Image.lz4 dtbo.img -j$(nproc --all)
 
       - name: Package with AnyKernel3
         run: |
@@ -83,6 +88,9 @@ jobs:
           sed -i 's/device.name1=.*/device.name1=redfin/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=bramble/' anykernel.sh
           cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
+          if [ -f $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img ]; then
+            cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img .
+          fi
           zip -r9 $GITHUB_WORKSPACE/AnyKernel3-LineageOS23.2-Docker-redfin.zip * -x .git README.md *placeholder
 
       - name: Repack Official boot.img
