@@ -108,6 +108,10 @@ jobs:
           sed -i 's/device.name2=.*/device.name2=bramble/' anykernel.sh
           sed -i 's/do.modules=0/do.modules=1/' anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=1/' anykernel.sh
+    sed -i 's|BLOCK=.*|BLOCK=boot;|' anykernel.sh
+    sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/' anykernel.sh
+    sed -i 's/dump_boot/split_boot/' anykernel.sh
+    sed -i 's/write_boot/flash_boot/' anykernel.sh
 
           cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
 
