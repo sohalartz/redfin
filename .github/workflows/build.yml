@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
             git curl zip lz4 python3 python-is-python3 ccache \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libncurses5 libtinfo5 \
-            cpio binutils || true
+            cpio binutils xz-utils || true
 
       - name: Download Proton-Clang Compiler
         run: |
@@ -89,7 +89,7 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             Image.lz4 modules -j$(nproc --all)
 
-          # Install modules to a staging directory
+          # Install modules to staging directory
           make O=out ARCH=arm64 \
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -134,20 +134,32 @@ jobs:
           mkdir -p magisk_env
           unzip -q Magisk.apk -d magisk_env/
 
-          # Prepare native Linux x86_64 magiskboot and ARM64 binaries
+          # Prepare native Magisk v28+ binaries
           cp magisk_env/lib/x86_64/libmagiskboot.so ./magiskboot
           chmod +x ./magiskboot
           cp magisk_env/lib/arm64-v8a/libmagiskinit.so ./magiskinit
-          cp magisk_env/lib/arm64-v8a/libmagisk64.so ./magisk64
-          cp magisk_env/lib/arm64-v8a/libmagisk32.so ./magisk32
+          chmod +x ./magiskinit
+          cp magisk_env/lib/arm64-v8a/libmagisk.so ./magisk
+          chmod +x ./magisk
+          cp magisk_env/lib/arm64-v8a/libinit-ld.so ./init-ld
           cp magisk_env/assets/boot_patch.sh ./
           cp magisk_env/assets/util_functions.sh ./
           cp magisk_env/assets/stub.apk ./
 
-          # 4. Patch stock_boot.img with Magisk
+          # 4. Patch stock_boot.img with Magisk (bypass Android env check)
+          export ARCH=arm64
+          export ABI=arm64-v8a
+          export ABI32=armeabi-v7a
+          export IS64BIT=true
+          export API=36
+          export BOOTMODE=false
           export KEEPVERITY=false
           export KEEPFORCEENCRYPT=true
           export PATCHVBMETAFLAG=false
+
+          # Prevent util_functions from trying to read Android build.prop
+          sed -i 's/api_level_arch_detect/# api_level_arch_detect/' boot_patch.sh
+
           sh boot_patch.sh stock_boot.img
 
           echo "Magisk patching output:"
