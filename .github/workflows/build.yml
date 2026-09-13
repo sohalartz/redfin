@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
             git curl zip lz4 python3 python-is-python3 ccache \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libncurses5 libtinfo5 \
-            cpio binutils xz-utils || true
+            cpio binutils || true
 
       - name: Download Proton-Clang Compiler
         run: |
@@ -119,7 +119,7 @@ jobs:
 
           zip -r9 $GITHUB_WORKSPACE/AnyKernel3-LineageOS23.2-Docker-redfin.zip * -x .git README.md *placeholder
 
-      - name: Pre-Patch Magisk Root & Build 96MB AVB-Signed boot.img
+      - name: Build 96MB AVB-Signed boot.img
         run: |
           # 1. Download official stock boot.img
           curl -sL https://mirrorbits.lineageos.org/full/redfin/20260907/boot.img -o stock_boot.img
@@ -128,92 +128,30 @@ jobs:
           git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools
           git clone --depth=1 https://android.googlesource.com/platform/external/avb avb_tools
 
-          # 3. Download official Magisk release APK and extract binaries
-          MAGISK_VER="v28.1"
-          curl -sL "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VER}/Magisk-${MAGISK_VER}.apk" -o Magisk.apk
-          mkdir -p magisk_env
-          unzip -q Magisk.apk -d magisk_env/
+          # 3. Unpack stock boot.img to extract ramdisk
+          python3 mkbootimg_tools/unpack_bootimg.py --boot_img stock_boot.img --out stock_unpacked
 
-          # Prepare native Magisk v28+ binaries
-          cp magisk_env/lib/x86_64/libmagiskboot.so ./magiskboot
-          chmod +x ./magiskboot
-          cp magisk_env/lib/arm64-v8a/libmagiskinit.so ./magiskinit
-          chmod +x ./magiskinit
-          cp magisk_env/lib/arm64-v8a/libmagisk.so ./magisk
-          chmod +x ./magisk
-          cp magisk_env/lib/arm64-v8a/libinit-ld.so ./init-ld
-          cp magisk_env/assets/stub.apk ./
-
-          # 4. Unpack stock boot.img with magiskboot (extracts raw ramdisk.cpio)
-          ./magiskboot unpack stock_boot.img
-          cp ramdisk.cpio stock_ramdisk.cpio
-
-          # 5. Compress Magisk payloads with magiskboot
-          ./magiskboot compress=xz magisk magisk.xz
-          ./magiskboot compress=xz stub.apk stub.xz
-          ./magiskboot compress=xz init-ld init-ld.xz
-
-          # 6. Patch ramdisk.cpio with Magisk root
-          echo "KEEPVERITY=false" > config
-          echo "KEEPFORCEENCRYPT=true" >> config
-          echo "PATCHVBMETAFLAG=false" >> config
-          echo "RECOVERYMODE=false" >> config
-
-          ./magiskboot cpio ramdisk.cpio \
-            "add 0750 init magiskinit" \
-            "mkdir 0750 overlay.d" \
-            "mkdir 0750 overlay.d/sbin" \
-            "add 0644 overlay.d/sbin/magisk.xz magisk.xz" \
-            "add 0644 overlay.d/sbin/stub.xz stub.xz" \
-            "add 0644 overlay.d/sbin/init-ld.xz init-ld.xz" \
-            "patch" \
-            "backup stock_ramdisk.cpio" \
-            "mkdir 000 .backup" \
-            "add 000 .backup/.magisk config"
-
-          # 7. Compress patched ramdisk to lz4_legacy format expected by Pixel 5 ABL
-          ./magiskboot compress=lz4_legacy ramdisk.cpio magisk_ramdisk.lz4
-          ./magiskboot compress=lz4_legacy stock_ramdisk.cpio stock_ramdisk.lz4
-
-          # 8. Repack Pre-Rooted Docker boot.img with AOSP mkbootimg
+          # 4. Repack Docker boot.img with extracted stock ramdisk
           python3 mkbootimg_tools/mkbootimg.py \
             --header_version 3 \
             --os_version 16.0.0 \
             --os_patch_level 2026-08 \
             --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
-            --ramdisk magisk_ramdisk.lz4 \
-            -o boot-docker-magisk-raw.img
+            --ramdisk stock_unpacked/ramdisk \
+            -o boot-docker-raw.img
 
-          # Sign with AVB 2.0 footer and pad to 96 MB (100,663,296 bytes)
+          # 5. Sign with AVB 2.0 footer and pad to exactly 96 MB (100,663,296 bytes)
           python3 avb_tools/avbtool.py add_hash_footer \
-            --image boot-docker-magisk-raw.img \
+            --image boot-docker-raw.img \
             --partition_size 100663296 \
             --partition_name boot \
             --hash_algorithm sha256 \
             --salt c9cfcce701396e09844a736f351a4499e64a067948657e4bcbf3b49884e19691
 
-          mv boot-docker-magisk-raw.img $GITHUB_WORKSPACE/boot-docker-magisk-redfin.img
+          mv boot-docker-raw.img $GITHUB_WORKSPACE/boot-docker-redfin.img
 
-          # 9. Repack Clean Stock-Ramdisk (No-Magisk) Docker boot.img
-          python3 mkbootimg_tools/mkbootimg.py \
-            --header_version 3 \
-            --os_version 16.0.0 \
-            --os_patch_level 2026-08 \
-            --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
-            --ramdisk stock_ramdisk.lz4 \
-            -o boot-docker-stock-raw.img
-
-          python3 avb_tools/avbtool.py add_hash_footer \
-            --image boot-docker-stock-raw.img \
-            --partition_size 100663296 \
-            --partition_name boot \
-            --hash_algorithm sha256 \
-            --salt c9cfcce701396e09844a736f351a4499e64a067948657e4bcbf3b49884e19691
-
-          mv boot-docker-stock-raw.img $GITHUB_WORKSPACE/boot-docker-stock-redfin.img
-
-          echo "Generated Images:"
-          ls -lh $GITHUB_WORKSPACE/*.img
+          echo "Generated boot.img:"
+          ls -lh $GITHUB_WORKSPACE/boot-docker-redfin.img
 
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
@@ -221,5 +159,4 @@ jobs:
           name: Pixel5-Docker-Kernel
           path: |
             AnyKernel3-LineageOS23.2-Docker-redfin.zip
-            boot-docker-magisk-redfin.img
-            boot-docker-stock-redfin.img
+            boot-docker-redfin.img
