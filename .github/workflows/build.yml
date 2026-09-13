@@ -96,20 +96,28 @@ jobs:
           cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
           zip -r9 $GITHUB_WORKSPACE/AnyKernel3-LineageOS23.2-Docker-redfin.zip * -x .git README.md *placeholder
 
-      - name: Repack Official boot.img
+      - name: Repack Official boot.img with AOSP mkbootimg
         run: |
           # 1. Download official stock boot.img
           curl -sL https://mirrorbits.lineageos.org/full/redfin/20260907/boot.img -o stock_boot.img
 
-          # 2. Extract magiskboot binary from official Magisk APK
-          curl -sL https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -o Magisk.apk
-          unzip -p Magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
-          chmod +x magiskboot
+          # 2. Clone official LineageOS mkbootimg tools
+          git clone --depth=1 https://github.com/LineageOS/android_system_tools_mkbootimg.git mkbootimg_tools
 
-          # 3. Unpack stock boot.img, replace kernel, and repack
-          ./magiskboot unpack stock_boot.img
-          cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 kernel
-          ./magiskboot repack stock_boot.img $GITHUB_WORKSPACE/boot-docker-redfin.img
+          # 3. Unpack stock boot.img to extract ramdisk
+          python3 mkbootimg_tools/unpack_bootimg.py --boot_img stock_boot.img --out unpacked
+
+          # 4. Repack using compiled Image.lz4 and extracted ramdisk
+          python3 mkbootimg_tools/mkbootimg.py \
+            --header_version 3 \
+            --os_version 16.0.0 \
+            --os_patch_level 2026-08 \
+            --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
+            --ramdisk unpacked/ramdisk \
+            -o $GITHUB_WORKSPACE/boot-docker-redfin.img
+
+          echo "Repacked boot.img created successfully:"
+          ls -lh $GITHUB_WORKSPACE/boot-docker-redfin.img
 
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
