@@ -48,13 +48,18 @@ jobs:
           sed -i 's/CONFIG_CFI_CLANG=y/# CONFIG_CFI_CLANG is not set/' $DEFCONFIG
           echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
 
-          # 4. Disable auto localversion to maintain stable module vermagic
+          # 4. Enforce exact Google stock vermagic matching
           sed -i 's/CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+          if grep -q "CONFIG_LOCALVERSION=" $DEFCONFIG; then
+            sed -i 's/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-g85b17737b5f2-ab7508408"/' $DEFCONFIG
+          else
+            echo 'CONFIG_LOCALVERSION="-g85b17737b5f2-ab7508408"' >> $DEFCONFIG
+          fi
 
-          # 5. Append Docker & Halium configurations
+          # 5. Append Docker & Halium configurations + Built-in storage/power drivers
           cat ../configs/docker_halium.config >> $DEFCONFIG
 
-          echo "Kernel defconfig successfully patched."
+          echo "Kernel defconfig successfully patched with vermagic and Docker flags."
 
       - name: Compile Kernel (Image.lz4)
         run: |
