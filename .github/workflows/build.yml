@@ -1,0 +1,154 @@
+name: Build Pixel 5 Halium & Docker Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Compile Kernel & Package Boot Images
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            git curl zip lz4 python3 python-is-python3 ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libncurses5 libtinfo5 \
+            cpio binutils make
+
+      - name: Download Proton-Clang Toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+
+      - name: Clone LineageOS 18.1 Pixel 5 Kernel (Android 11)
+        run: |
+          git clone --depth=1 -b lineage-18.1 https://github.com/LineageOS/android_kernel_google_redbull.git kernel
+
+      - name: Patch Defconfig for Docker & Halium 11
+        run: |
+          cd kernel
+          DEFCONFIG="arch/arm64/configs/redbull_defconfig"
+
+          # 1. Enable PID Namespaces (explicitly disabled by Google default)
+          sed -i 's/# CONFIG_PID_NS is not set/CONFIG_PID_NS=y/' $DEFCONFIG
+
+          # 2. Enable Fair Group Scheduling (required for CPU quota/shares)
+          sed -i 's/# CONFIG_FAIR_GROUP_SCHED is not set/CONFIG_FAIR_GROUP_SCHED=y/' $DEFCONFIG
+
+          # 3. Disable LTO & CFI for standalone Clang compilation
+          sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' $DEFCONFIG
+          sed -i 's/CONFIG_CFI_CLANG=y/# CONFIG_CFI_CLANG is not set/' $DEFCONFIG
+          echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+
+          # 4. Disable auto localversion to maintain matching module vermagic
+          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' $DEFCONFIG
+
+          # 5. Append Docker, CGroups, Halium, and Systemd configurations
+          cat ../configs/docker_halium.config >> $DEFCONFIG
+
+          echo "Kernel defconfig successfully patched."
+
+      - name: Compile Kernel, DTBO & Modules
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          cd kernel
+
+          # Generate .config from patched defconfig
+          make O=out ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            redbull_defconfig
+
+          # Save generated config for release auditing
+          cp out/.config $GITHUB_WORKSPACE/kernel_config.txt
+
+          # Compile Image.lz4, dtbo.img, and kernel modules
+          make O=out ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.lz4 dtbo.img modules -j$(nproc --all)
+
+          # Install kernel modules to staging directory
+          make O=out ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            INSTALL_MOD_PATH=$GITHUB_WORKSPACE/modules_out \
+            modules_install
+
+          # Copy dtbo.img to workspace
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img $GITHUB_WORKSPACE/dtbo.img
+          fi
+
+          echo "Kernel compilation complete:"
+          ls -lh out/arch/arm64/boot/Image.lz4
+
+      - name: Package AnyKernel3 Flashable ZIP
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          cd anykernel
+          sed -i 's/device.name1=.*/device.name1=redfin/' anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=bramble/' anykernel.sh
+          sed -i 's/do.modules=0/do.modules=1/' anykernel.sh
+          sed -i 's/do.systemless=1/do.systemless=1/' anykernel.sh
+          sed -i 's|BLOCK=.*|BLOCK=boot;|' anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/' anykernel.sh
+          sed -i 's/dump_boot/split_boot/' anykernel.sh
+          sed -i 's/write_boot/flash_boot/' anykernel.sh
+
+          cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 .
+
+          # Place compiled kernel modules into AnyKernel3 module directory
+          mkdir -p modules/vendor/lib/modules
+          find $GITHUB_WORKSPACE/modules_out -name "*.ko" -exec cp {} modules/vendor/lib/modules/ \;
+          echo "Copied $(ls modules/vendor/lib/modules | wc -l) modules to AnyKernel3 package."
+
+          zip -r9 $GITHUB_WORKSPACE/AnyKernel3-Halium11-Docker-redfin.zip * -x .git README.md *placeholder
+
+      - name: Build Fastboot-Flashable 96MB boot.img (Header v3)
+        run: |
+          # 1. Download official AOSP boot and AVB tools
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools
+          git clone --depth=1 https://android.googlesource.com/platform/external/avb avb_tools
+
+          # 2. Pack new Image.lz4 with official Android 11 stock ramdisk
+          python3 mkbootimg_tools/mkbootimg.py \
+            --header_version 3 \
+            --os_version 11.0.0 \
+            --os_patch_level 2021-10 \
+            --kernel $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.lz4 \
+            --ramdisk $GITHUB_WORKSPACE/configs/stock_ramdisk.lz4 \
+            -o boot-raw.img
+
+          # 3. Sign and pad to exact partition size (100,663,296 bytes / 96 MB)
+          python3 avb_tools/avbtool.py add_hash_footer \
+            --image boot-raw.img \
+            --partition_size 100663296 \
+            --partition_name boot \
+            --hash_algorithm sha256
+
+          mv boot-raw.img $GITHUB_WORKSPACE/boot-halium11-docker-redfin.img
+
+          echo "Generated fastboot boot image:"
+          ls -lh $GITHUB_WORKSPACE/boot-halium11-docker-redfin.img
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel5-Halium11-Docker-Kernel
+          path: |
+            boot-halium11-docker-redfin.img
+            AnyKernel3-Halium11-Docker-redfin.zip
+            dtbo.img
+            kernel_config.txt
